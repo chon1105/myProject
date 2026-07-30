@@ -17,8 +17,9 @@ def load_data():
     # 인구 데이터 불러오기 (압축된 Gzip CSV 파일)
     pop_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
 
-    # 코드(행정동 코드) 열은 문자열(string)로 읽어 앞자리 0 손실 방지
+    # 코드(행정동 코드) 열을 문자열로 읽고 10자리 포맷 맞춤
     df = pd.read_csv(pop_url, compression="gzip", dtype={"코드": str})
+    df["코드"] = df["코드"].astype(str).str.zfill(10)
 
     # 가장 최신 연도 데이터만 필터링
     latest_year = df["연도"].max()
@@ -73,23 +74,27 @@ def load_data():
     return grouped, latest_year
 
 
-# GeoJSON 경계 데이터 및 시군구별 중심 좌표(위도/경도) 계산 함수
+# 2. GeoJSON 데이터 및 중심 좌표(위경도) 자동 계산 함수
 @st.cache_data
 def load_geojson_and_centroids():
     geojson_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
     response = requests.get(geojson_url)
     geojson_data = response.json()
 
-    # 각 시군구 GeoJSON 다각형의 중심 좌표(centroid) 계산
     centroids = {}
     for feature in geojson_data.get("features", []):
-        code = feature["properties"].get("코드")
+        # GeoJSON 내부 코드값을 5자리 문자열로 표준화하여 매핑 오류 완전 방지
+        raw_code = str(feature.get("properties", {}).get("코드", "")).strip()
+        code = raw_code[:5].zfill(5) if raw_code else ""
+
+        # GeoJSON 속성 코드 업데이트
+        feature["properties"]["코드"] = code
+
         geom = feature.get("geometry", {})
         coords = geom.get("coordinates", [])
 
         lons, lats = [], []
 
-        # 재귀적으로 모든 위경도 좌표 추출
         def extract_coords(c_list):
             if not c_list:
                 return
@@ -102,7 +107,7 @@ def load_geojson_and_centroids():
 
         extract_coords(coords)
 
-        if lons and lats:
+        if lons and lats and code:
             centroids[code] = {
                 "lat": sum(lats) / len(lats),
                 "lon": sum(lons) / len(lons),
@@ -114,63 +119,99 @@ def load_geojson_and_centroids():
 # 메인 화면 구성
 st.title("🗺️ 전국 시군구 고령화율 지도")
 
-# 데이터 및 GeoJSON 불러오기
+# 데이터 로딩
 data, latest_year = load_data()
 geojson, centroids = load_geojson_and_centroids()
 
-st.write(
-    f"**기준 연도:** {latest_year}년 | 💡 **하단 표에서 지역을 클릭하면 지도가 확대되며 상세 데이터가 표시됩니다.**"
-)
-
-# 기본 중심점 및 줌 레벨 (전국 보기)
-center_lat, center_lon = 36.35, 127.8
-zoom_level = 6.0
-
-# 표 데이터 준비 (상위 10개, 하위 10개)
-table_df = data[["시도", "시군구", "고령화율", "전체인구", "고령인구", "시군구코드", "고령화율_구간"]].copy()
+# 상위 10개, 하위 10개 표 데이터 추출
+display_cols = [
+    "시도",
+    "시군구",
+    "고령화율",
+    "전체인구",
+    "고령인구",
+    "시군구코드",
+    "고령화율_구간",
+]
 
 top10 = (
-    table_df.sort_values(by="고령화율", ascending=False)
+    data[display_cols]
+    .sort_values(by="고령화율", ascending=False)
     .head(10)
     .reset_index(drop=True)
 )
 
 bottom10 = (
-    table_df.sort_values(by="고령화율", ascending=True)
+    data[display_cols]
+    .sort_values(by="고령화율", ascending=True)
     .head(10)
     .reset_index(drop=True)
 )
 
-# 하단 표 선택 이벤트 처리를 위한 세션 상태 업데이트
+
+# 표 클릭 이벤트 또는 검색 선택에 의해 지정될 선택 코드 추적
 selected_code = None
 
-# 지도를 그리기 전 세션 상태를 먼저 점검
-if "selected_region_code" in st.session_state:
-    selected_code = st.session_state.selected_region_code
+# 1) 상위 10개 표 선택 상태 확인
+if "top10_table" in st.session_state:
+    rows = st.session_state.top10_table.get("selection", {}).get("rows", [])
+    if rows:
+        selected_code = top10.iloc[rows[0]]["시군구코드"]
 
-# 선택된 지역 정보 추출 및 지도 확대 설정 (줌 레벨 20% 증가: 6.0 -> 7.2)
+# 2) 하위 10개 표 선택 상태 확인
+if "bottom10_table" in st.session_state:
+    rows = st.session_state.bottom10_table.get("selection", {}).get("rows", [])
+    if rows and selected_code is None:
+        selected_code = bottom10.iloc[rows[0]]["시군구코드"]
+
+# 3) 지역 셀렉트박스로 직접 선택할 수도 있도록 상단에 수단 제공
+region_options = ["전국 전체 보기"] + [
+    f"{row['시도']} {row['시군구']}" for _, row in data.iterrows()
+]
+selected_region_str = st.selectbox(
+    "🔍 지역 직접 검색/선택",
+    region_options,
+    help="목록에서 원하는 지역을 선택하거나 하단 표에서 클릭하면 해당 위치가 지도에 강조됩니다.",
+)
+
+if selected_region_str != "전국 전체 보기":
+    sido, sigungu = selected_region_str.split(" ", 1)
+    matched = data[(data["시도"] == sido) & (data["시군구"] == sigungu)]
+    if not matched.empty:
+        selected_code = matched.iloc[0]["시군구코드"]
+
+
+# 기본 지도 위치 및 줌 레벨
+center_lat, center_lon = 36.35, 127.8
+zoom_level = 6.0  # 전국 보기 줌
+
 selected_info = None
+
+# 선택된 지역이 있을 경우 지도 중심 이동 및 20% 확대 적용
 if selected_code and selected_code in centroids:
     center_lat = centroids[selected_code]["lat"]
     center_lon = centroids[selected_code]["lon"]
-    zoom_level = 7.2  # 기존 6.0 대비 20% 확대
+    zoom_level = 7.5  # 기존 6.0 대비 20% 이상 확대
 
-    # 선택된 지역 데이터 가져오기
     matched_row = data[data["시군구코드"] == selected_code]
     if not matched_row.empty:
         selected_info = matched_row.iloc[0]
 
-# 선택된 지역 정보 박스 상단 표시
+# 상단 안내 및 선택 상태 표시
+st.write(
+    f"**기준 연도:** {latest_year}년 | 💡 **하단 표의 지역을 클릭하거나 위 검색창을 이용해 지도 위치를 확대해 보세요.**"
+)
+
 if selected_info is not None:
     st.info(
-        f"📍 **선택한 지역:** {selected_info['시도']} {selected_info['시군구']} | "
+        f"📍 **선택된 지역:** [{selected_info['시도']} {selected_info['시군구']}] | "
         f"**고령화율:** {selected_info['고령화율']:.1f}% | "
         f"**전체인구:** {selected_info['전체인구']:,}명 | "
         f"**고령인구:** {selected_info['고령인구']:,}명 | "
         f"**구간:** {selected_info['고령화율_구간']}"
     )
 
-# 색상 매핑 설정 (5단계)
+# 5단계 범주화 색상 매핑
 color_discrete_map = {
     "19% 미만": "#edf8fb",
     "19% 이상 ~ 23% 미만": "#b2e2e2",
@@ -201,14 +242,14 @@ fig = px.choropleth_mapbox(
     labels={"고령화율": "고령화율", "시도": "시도"},
 )
 
-# 선택된 지역이 있을 경우, 지도상 해당 위치에 데이터 핀/안내 박스 추가
+# 선택된 지역 위치에 강렬한 핀 마커 및 텍스트 박스 표시
 if selected_info is not None:
     fig.add_trace(
         go.Scattermapbox(
             lat=[center_lat],
             lon=[center_lon],
             mode="markers+text",
-            marker=dict(size=16, color="crimson"),
+            marker=dict(size=18, color="red"),
             text=[f"📍 {selected_info['시군구']}"],
             textposition="top center",
             hoverinfo="text",
@@ -229,25 +270,28 @@ fig.update_layout(
     legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01),
 )
 
-# 지도 출력
+# 지도 표시
 st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
-# 지도 하단 표 영역 (선택 가능 테이블)
+# 지도 하단: 고령화율 Top 10 / Bottom 10 선택 가능한 표
 col1, col2 = st.columns(2)
-
-# 화면에 보여줄 칼럼 구성
-display_cols = ["시도", "시군구", "고령화율", "전체인구", "고령인구"]
 
 with col1:
     st.subheader("🔴 고령화율 가장 높은 곳 Top 10")
-    formatted_top10 = top10[display_cols].copy()
-    formatted_top10["전체인구"] = formatted_top10["전체인구"].apply(lambda x: f"{x:,}명")
-    formatted_top10["고령인구"] = formatted_top10["고령인구"].apply(lambda x: f"{x:,}명")
-    formatted_top10["고령화율"] = formatted_top10["고령화율"].apply(lambda x: f"{x:.1f}%")
+    formatted_top10 = top10[["시도", "시군구", "고령화율", "전체인구", "고령인구"]].copy()
+    formatted_top10["전체인구"] = formatted_top10["전체인구"].apply(
+        lambda x: f"{x:,}명"
+    )
+    formatted_top10["고령인구"] = formatted_top10["고령인구"].apply(
+        lambda x: f"{x:,}명"
+    )
+    formatted_top10["고령화율"] = formatted_top10["고령화율"].apply(
+        lambda x: f"{x:.1f}%"
+    )
 
-    top_event = st.dataframe(
+    st.dataframe(
         formatted_top10,
         use_container_width=True,
         on_select="rerun",
@@ -255,35 +299,25 @@ with col1:
         key="top10_table",
     )
 
-    # 클릭 이벤트 처리
-    selected_top_rows = top_event.get("selection", {}).get("rows", [])
-    if selected_top_rows:
-        idx = selected_top_rows[0]
-        code = top10.iloc[idx]["시군구코드"]
-        if st.session_state.get("selected_region_code") != code:
-            st.session_state.selected_region_code = code
-            st.rerun()
-
 with col2:
     st.subheader("🔵 고령화율 가장 낮은 곳 Top 10")
-    formatted_bottom10 = bottom10[display_cols].copy()
-    formatted_bottom10["전체인구"] = formatted_bottom10["전체인구"].apply(lambda x: f"{x:,}명")
-    formatted_bottom10["고령인구"] = formatted_bottom10["고령인구"].apply(lambda x: f"{x:,}명")
-    formatted_bottom10["고령화율"] = formatted_bottom10["고령화율"].apply(lambda x: f"{x:.1f}%")
+    formatted_bottom10 = bottom10[
+        ["시도", "시군구", "고령화율", "전체인구", "고령인구"]
+    ].copy()
+    formatted_bottom10["전체인구"] = formatted_bottom10["전체인구"].apply(
+        lambda x: f"{x:,}명"
+    )
+    formatted_bottom10["고령인구"] = formatted_bottom10["고령인구"].apply(
+        lambda x: f"{x:,}명"
+    )
+    formatted_bottom10["고령화율"] = formatted_bottom10["고령화율"].apply(
+        lambda x: f"{x:.1f}%"
+    )
 
-    bottom_event = st.dataframe(
+    st.dataframe(
         formatted_bottom10,
         use_container_width=True,
         on_select="rerun",
         selection_mode="single-row",
         key="bottom10_table",
     )
-
-    # 클릭 이벤트 처리
-    selected_bottom_rows = bottom_event.get("selection", {}).get("rows", [])
-    if selected_bottom_rows:
-        idx = selected_bottom_rows[0]
-        code = bottom10.iloc[idx]["시군구코드"]
-        if st.session_state.get("selected_region_code") != code:
-            st.session_state.selected_region_code = code
-            st.rerun()
