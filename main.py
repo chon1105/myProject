@@ -1,5 +1,6 @@
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -10,13 +11,13 @@ st.set_page_config(
 )
 
 
-# 1. 데이터 로딩 및 전처리 함수 (캐싱 적용으로 속도 최적화)
+# 1. 데이터 로딩 및 전처리 함수 (캐싱 적용)
 @st.cache_data
 def load_data():
     # 인구 데이터 불러오기 (압축된 Gzip CSV 파일)
     pop_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/population_yearly.csv.gz"
 
-    # 코드(행정동 코드) 열은 반드시 문자열(string)로 읽어 앞자리 0이 손실되지 않도록 함
+    # 코드(행정동 코드) 열은 문자열(string)로 읽어 앞자리 0 손실 방지
     df = pd.read_csv(pop_url, compression="gzip", dtype={"코드": str})
 
     # 가장 최신 연도 데이터만 필터링
@@ -27,7 +28,6 @@ def load_data():
     df_latest["시군구코드"] = df_latest["코드"].str.slice(0, 5)
 
     # 65세 이상 인구 열 찾기 ('계_65세'부터 '계_100세 이상'까지)
-    # '계_'로 시작하면서 나이가 65세 이상인 열 추출
     total_cols = [
         col
         for col in df_latest.columns
@@ -36,13 +36,11 @@ def load_data():
 
     elderly_cols = []
     for col in total_cols:
-        # '계_65세' 형태에서 숫자 부분만 추출
         age_str = col.replace("계_", "").replace("세", "").replace(" 이상", "")
         if age_str.isdigit() and int(age_str) >= 65:
             elderly_cols.append(col)
 
-    # 시군구 단위로 인구 합산 (시도, 시군구, 시군구코드 기준 그룹화)
-    # 전체 인구 합계와 65세 이상 인구 합계 계산
+    # 시군구 단위로 인구 합산
     df_latest["전체인구"] = df_latest[total_cols].sum(axis=1)
     df_latest["고령인구"] = df_latest[elderly_cols].sum(axis=1)
 
@@ -54,7 +52,7 @@ def load_data():
         .reset_index()
     )
 
-    # 고령화율(%) 계산 (65세 이상 인구 / 전체 인구 * 100)
+    # 고령화율(%) 계산
     grouped["고령화율"] = (grouped["고령인구"] / grouped["전체인구"]) * 100
     grouped["고령화율"] = grouped["고령화율"].round(1)
 
@@ -75,12 +73,42 @@ def load_data():
     return grouped, latest_year
 
 
-# GeoJSON 경계 데이터 로딩 함수
+# GeoJSON 경계 데이터 및 시군구별 중심 좌표(위도/경도) 계산 함수
 @st.cache_data
-def load_geojson():
+def load_geojson_and_centroids():
     geojson_url = "https://raw.githubusercontent.com/greatsong/modudata/main/data/boundaries/sigungu_kr.geojson"
     response = requests.get(geojson_url)
-    return response.json()
+    geojson_data = response.json()
+
+    # 각 시군구 GeoJSON 다각형의 중심 좌표(centroid) 계산
+    centroids = {}
+    for feature in geojson_data.get("features", []):
+        code = feature["properties"].get("코드")
+        geom = feature.get("geometry", {})
+        coords = geom.get("coordinates", [])
+
+        lons, lats = [], []
+
+        # 재귀적으로 모든 위경도 좌표 추출
+        def extract_coords(c_list):
+            if not c_list:
+                return
+            if isinstance(c_list[0], (int, float)):
+                lons.append(c_list[0])
+                lats.append(c_list[1])
+            else:
+                for sub in c_list:
+                    extract_coords(sub)
+
+        extract_coords(coords)
+
+        if lons and lats:
+            centroids[code] = {
+                "lat": sum(lats) / len(lats),
+                "lon": sum(lons) / len(lons),
+            }
+
+    return geojson_data, centroids
 
 
 # 메인 화면 구성
@@ -88,11 +116,61 @@ st.title("🗺️ 전국 시군구 고령화율 지도")
 
 # 데이터 및 GeoJSON 불러오기
 data, latest_year = load_data()
-geojson = load_geojson()
+geojson, centroids = load_geojson_and_centroids()
 
-st.write(f"**기준 연도:** {latest_year}년 (시군구 단위 65세 이상 인구 비율)")
+st.write(
+    f"**기준 연도:** {latest_year}년 | 💡 **하단 표에서 지역을 클릭하면 지도가 확대되며 상세 데이터가 표시됩니다.**"
+)
 
-# 색상 매핑 (연한 색에서 진한 색으로 5단계 설정)
+# 기본 중심점 및 줌 레벨 (전국 보기)
+center_lat, center_lon = 36.35, 127.8
+zoom_level = 6.0
+
+# 표 데이터 준비 (상위 10개, 하위 10개)
+table_df = data[["시도", "시군구", "고령화율", "전체인구", "고령인구", "시군구코드", "고령화율_구간"]].copy()
+
+top10 = (
+    table_df.sort_values(by="고령화율", ascending=False)
+    .head(10)
+    .reset_index(drop=True)
+)
+
+bottom10 = (
+    table_df.sort_values(by="고령화율", ascending=True)
+    .head(10)
+    .reset_index(drop=True)
+)
+
+# 하단 표 선택 이벤트 처리를 위한 세션 상태 업데이트
+selected_code = None
+
+# 지도를 그리기 전 세션 상태를 먼저 점검
+if "selected_region_code" in st.session_state:
+    selected_code = st.session_state.selected_region_code
+
+# 선택된 지역 정보 추출 및 지도 확대 설정 (줌 레벨 20% 증가: 6.0 -> 7.2)
+selected_info = None
+if selected_code and selected_code in centroids:
+    center_lat = centroids[selected_code]["lat"]
+    center_lon = centroids[selected_code]["lon"]
+    zoom_level = 7.2  # 기존 6.0 대비 20% 확대
+
+    # 선택된 지역 데이터 가져오기
+    matched_row = data[data["시군구코드"] == selected_code]
+    if not matched_row.empty:
+        selected_info = matched_row.iloc[0]
+
+# 선택된 지역 정보 박스 상단 표시
+if selected_info is not None:
+    st.info(
+        f"📍 **선택한 지역:** {selected_info['시도']} {selected_info['시군구']} | "
+        f"**고령화율:** {selected_info['고령화율']:.1f}% | "
+        f"**전체인구:** {selected_info['전체인구']:,}명 | "
+        f"**고령인구:** {selected_info['고령인구']:,}명 | "
+        f"**구간:** {selected_info['고령화율_구간']}"
+    )
+
+# 색상 매핑 설정 (5단계)
 color_discrete_map = {
     "19% 미만": "#edf8fb",
     "19% 이상 ~ 23% 미만": "#b2e2e2",
@@ -101,67 +179,111 @@ color_discrete_map = {
     "38% 이상": "#006d2c",
 }
 
-# Plotly 단계구분도(Choropleth Map) 생성
+# Plotly 단계구분도 생성
 fig = px.choropleth_mapbox(
     data,
     geojson=geojson,
-    locations="시군구코드",  # GeoJSON 매핑 기준 키 (데이터)
-    featureidkey="properties.코드",  # GeoJSON 매핑 기준 키 (GeoJSON 속성)
-    color="고령화율_구간",  # 5단계 범주화 열 적용
+    locations="시군구코드",
+    featureidkey="properties.코드",
+    color="고령화율_구간",
     color_discrete_map=color_discrete_map,
     category_orders={"고령화율_구간": list(color_discrete_map.keys())},
-    center={"lat": 36.35, "lon": 127.8},  # 대한민국 중심 좌표
-    zoom=6,
-    mapbox_style="white-bg",  # 배경 타일 없이 경계선만 표시
-    hover_name="시군구",  # 마우스 올렸을 때 굵은 글씨로 표시될 이름
+    center={"lat": center_lat, "lon": center_lon},
+    zoom=zoom_level,
+    mapbox_style="white-bg",
+    hover_name="시군구",
     hover_data={
         "시도": True,
-        "고령화율": ":.1f%",  # 소수점 첫째자리 및 % 표시
-        "시군구코드": False,  # 툴팁에서 코드 숨김
-        "고령화율_구간": False,  # 툴팁에서 구간 라벨 숨김
+        "고령화율": ":.1f%",
+        "시군구코드": False,
+        "고령화율_구간": False,
     },
     labels={"고령화율": "고령화율", "시도": "시도"},
 )
 
-# 지도 레이아웃 세부 설정
+# 선택된 지역이 있을 경우, 지도상 해당 위치에 데이터 핀/안내 박스 추가
+if selected_info is not None:
+    fig.add_trace(
+        go.Scattermapbox(
+            lat=[center_lat],
+            lon=[center_lon],
+            mode="markers+text",
+            marker=dict(size=16, color="crimson"),
+            text=[f"📍 {selected_info['시군구']}"],
+            textposition="top center",
+            hoverinfo="text",
+            hovertext=(
+                f"<b>{selected_info['시도']} {selected_info['시군구']}</b><br>"
+                f"고령화율: {selected_info['고령화율']:.1f}%<br>"
+                f"전체인구: {selected_info['전체인구']:,}명<br>"
+                f"고령인구: {selected_info['고령인구']:,}명"
+            ),
+            showlegend=False,
+        )
+    )
+
+# 지도 레이아웃 설정
 fig.update_layout(
     margin={"r": 0, "t": 10, "l": 0, "b": 10},
     legend_title_text="고령화율 구간",
     legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01),
 )
 
-# 스트림릿에 지도 출력
+# 지도 출력
 st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
 
-# 지도 하단: 고령화율 상위/하위 10개 지역 표 구성
+# 지도 하단 표 영역 (선택 가능 테이블)
 col1, col2 = st.columns(2)
 
-# 화면용 표 컬럼 재정의
-table_df = data[["시도", "시군구", "고령화율", "전체인구", "고령인구"]].copy()
+# 화면에 보여줄 칼럼 구성
+display_cols = ["시도", "시군구", "고령화율", "전체인구", "고령인구"]
 
 with col1:
     st.subheader("🔴 고령화율 가장 높은 곳 Top 10")
-    top10 = (
-        table_df.sort_values(by="고령화율", ascending=False)
-        .head(10)
-        .reset_index(drop=True)
+    formatted_top10 = top10[display_cols].copy()
+    formatted_top10["전체인구"] = formatted_top10["전체인구"].apply(lambda x: f"{x:,}명")
+    formatted_top10["고령인구"] = formatted_top10["고령인구"].apply(lambda x: f"{x:,}명")
+    formatted_top10["고령화율"] = formatted_top10["고령화율"].apply(lambda x: f"{x:.1f}%")
+
+    top_event = st.dataframe(
+        formatted_top10,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="top10_table",
     )
-    # 인구 수에 천 단위 쉼표 추가
-    top10["전체인구"] = top10["전체인구"].apply(lambda x: f"{x:,}명")
-    top10["고령인구"] = top10["고령인구"].apply(lambda x: f"{x:,}명")
-    top10["고령화율"] = top10["고령화율"].apply(lambda x: f"{x:.1f}%")
-    st.dataframe(top10, use_container_width=True)
+
+    # 클릭 이벤트 처리
+    selected_top_rows = top_event.get("selection", {}).get("rows", [])
+    if selected_top_rows:
+        idx = selected_top_rows[0]
+        code = top10.iloc[idx]["시군구코드"]
+        if st.session_state.get("selected_region_code") != code:
+            st.session_state.selected_region_code = code
+            st.rerun()
 
 with col2:
     st.subheader("🔵 고령화율 가장 낮은 곳 Top 10")
-    bottom10 = (
-        table_df.sort_values(by="고령화율", ascending=True)
-        .head(10)
-        .reset_index(drop=True)
+    formatted_bottom10 = bottom10[display_cols].copy()
+    formatted_bottom10["전체인구"] = formatted_bottom10["전체인구"].apply(lambda x: f"{x:,}명")
+    formatted_bottom10["고령인구"] = formatted_bottom10["고령인구"].apply(lambda x: f"{x:,}명")
+    formatted_bottom10["고령화율"] = formatted_bottom10["고령화율"].apply(lambda x: f"{x:.1f}%")
+
+    bottom_event = st.dataframe(
+        formatted_bottom10,
+        use_container_width=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="bottom10_table",
     )
-    bottom10["전체인구"] = bottom10["전체인구"].apply(lambda x: f"{x:,}명")
-    bottom10["고령인구"] = bottom10["고령인구"].apply(lambda x: f"{x:,}명")
-    bottom10["고령화율"] = bottom10["고령화율"].apply(lambda x: f"{x:.1f}%")
-    st.dataframe(bottom10, use_container_width=True)
+
+    # 클릭 이벤트 처리
+    selected_bottom_rows = bottom_event.get("selection", {}).get("rows", [])
+    if selected_bottom_rows:
+        idx = selected_bottom_rows[0]
+        code = bottom10.iloc[idx]["시군구코드"]
+        if st.session_state.get("selected_region_code") != code:
+            st.session_state.selected_region_code = code
+            st.rerun()
